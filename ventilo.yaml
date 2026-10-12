@@ -1,0 +1,308 @@
+esphome:
+  name: ventilo
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+web_server:
+  port: 80
+
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO23
+  miso_pin: GPIO19
+
+cc1101:
+  cs_pin: GPIO5
+  frequency: 433.92MHz
+  modulation_type: ASK/OOK
+
+globals:
+  - id: last_tx_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: last_rx_code
+    type: uint32_t
+    initial_value: '0'
+  - id: last_rx_ms
+    type: uint32_t
+    initial_value: '0'
+
+remote_receiver:
+  pin: GPIO13
+  dump: raw
+  tolerance: 40%
+  filter: 100us
+  idle: 5ms
+  # Détection de la télécommande physique : décode la trame, la compare aux
+  # signatures connues et met à jour l'état (synchro d'état).
+  on_raw:
+    then:
+      - lambda: |-
+          // Nos propres émissions ne doivent pas être prises pour la télécommande
+          if (millis() - id(last_tx_ms) < 500) return;
+
+          // Codage PWM : impulsion longue (~740 µs) = 1, courte (~250 µs) = 0
+          std::vector<bool> bits;
+          for (auto v : x) {
+            if (v > 0) bits.push_back(v > 500);
+          }
+          if (bits.size() < 32) return;
+
+          // Ordre = paramètre cmd de apply_cmd : 0 Power, 1-6 vitesses, 7 lumière, 8 couleur, 9 sens
+          static const uint32_t CODES[] = {
+            0x21D18508, 0x21D18269, 0x21D18850, 0x21D1866D, 0x21D18379,
+            0x21D18481, 0x21D18ABC, 0x21D18962, 0x21D18E56, 0x21D188FA,
+          };
+          // Trame : adresse (20 bits) | touche (5 bits) | compteur (3 bits) | contrôle (4 bits).
+          // Le compteur avance à chaque appui : on compare la touche, et le contrôle
+          // via (contrôle XOR quartet précédent), qui ne dépend que de la touche.
+          auto key = [](uint32_t c) { return c & 0xFFFFFF80; };
+          auto check = [](uint32_t c) { return (c ^ (c >> 4)) & 0xF; };
+          // Fenêtre glissante : tolère l'impulsion d'en-tête de la première répétition
+          for (size_t off = 0; off + 32 <= bits.size(); off++) {
+            uint32_t code = 0;
+            for (size_t i = 0; i < 32; i++) code = (code << 1) | (bits[off + i] ? 1 : 0);
+            for (int cmd = 0; cmd < 10; cmd++) {
+              if (key(code) != key(CODES[cmd]) || check(code) != check(CODES[cmd])) continue;
+              // La télécommande répète la même trame (même compteur) tant que le bouton
+              // est tenu : un seul appui. Un nouvel appui change le compteur.
+              uint32_t now = millis();
+              bool repeat = code == id(last_rx_code) && now - id(last_rx_ms) < 400;
+              id(last_rx_ms) = now;
+              if (repeat) return;
+              id(last_rx_code) = code;
+              ESP_LOGI("sync", "Télécommande : commande %d (0x%08X)", cmd, code);
+              id(apply_cmd).execute(cmd);
+              return;
+            }
+          }
+
+remote_transmitter:
+  pin: GPIO4
+  carrier_duty_percent: 100%
+  on_transmit:
+    then:
+      - cc1101.begin_tx
+  on_complete:
+    then:
+      - lambda: id(last_tx_ms) = millis();
+      - cc1101.begin_rx
+
+# État du ventilateur, tenu par le firmware (télécommande physique + API).
+# Modifiable via l'API pour corriger une dérive : rien n'est émis.
+switch:
+  - platform: template
+    id: etat_marche
+    name: "Etat marche"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: etat_lumiere
+    name: "Etat lumiere"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: etat_sens
+    name: "Etat sens inverse"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+number:
+  - platform: template
+    id: etat_vitesse
+    name: "Etat vitesse"
+    optimistic: true
+    min_value: 1
+    max_value: 6
+    step: 1
+    initial_value: 3
+    restore_value: true
+  - platform: template
+    id: etat_couleur
+    name: "Etat couleur"
+    optimistic: true
+    min_value: 0
+    max_value: 2
+    step: 1
+    initial_value: 0
+    restore_value: true
+
+script:
+  - id: apply_cmd
+    mode: queued
+    parameters:
+      cmd: int
+    then:
+      - lambda: |-
+          if (cmd == 0) {
+            id(etat_marche).publish_state(!id(etat_marche).state);
+          } else if (cmd >= 1 && cmd <= 6) {
+            id(etat_marche).publish_state(true);
+            auto call = id(etat_vitesse).make_call();
+            call.set_value(cmd);
+            call.perform();
+          } else if (cmd == 7) {
+            id(etat_lumiere).publish_state(!id(etat_lumiere).state);
+          } else if (cmd == 8) {
+            auto call = id(etat_couleur).make_call();
+            call.set_value(((int) id(etat_couleur).state + 1) % 3);
+            call.perform();
+          } else if (cmd == 9) {
+            id(etat_sens).publish_state(!id(etat_sens).state);
+          }
+
+  - id: tx_power
+    then:
+      - remote_transmitter.transmit_raw:
+          code: [264, -720, 245, -743, 737, -268, 229, -755, 242, -742, 265, -720, 266, -724, 738, -261, 736, -263, 722, -262, 238, -757, 715, -291, 226, -742, 265, -720, 266, -722, 735, -267, 744, -243, 266, -724, 262, -734, 263, -723, 265, -724, 750, -243, 262, -725, 726, -276, 264, -744, 246, -738, 242, -753, 241, -751, 740, -239, 263, -741, 244, -754, 242, -751, 243]
+          repeat: { times: 8, wait_time: 8ms }
+
+  - id: tx_v1
+    then:
+      - remote_transmitter.transmit_raw:
+          code: [264, -734, 242, -741, 736, -268, 228, -757, 242, -742, 266, -720, 266, -723, 739, -266, 744, -236, 733, -265, 253, -739, 716, -294, 226, -759, 241, -741, 247, -737, 735, -268, 720, -267, 266, -722, 237, -755, 240, -758, 242, -739, 242, -742, 736, -261, 238, -755, 244, -755, 741, -264, 721, -268, 229, -758, 739, -262, 238, -756, 243, -727, 740, -262, 238]
+          repeat: { times: 8, wait_time: 8ms }
+
+  - id: tx_v2
+    then:
+      - remote_transmitter.transmit_raw:
+          code: [240, -738, 266, -720, 736, -266, 252, -738, 245, -741, 265, -720, 265, -722, 738, -262, 736, -263, 724, -267, 252, -736, 716, -270, 265, -726, 266, -722, 270, -725, 733, -247, 748, -246, 267, -722, 269, -737, 243, -751, 716, -266, 252, -738, 246, -739, 242, -767, 242, -753, 741, -263, 227, -740, 736, -285, 241, -742, 243, -731, 268, -724, 268, -720, 266]
+          repeat: { times: 8, wait_time: 8ms }
+
+  - id: tx_v3
+    then:
+      - remote_transmitter.transmit_raw:
+          code: [289, -725, 244, -737, 716, -265, 252, -738, 266, -722, 266, -723, 245, -744, 738, -261, 737, -263, 723, -266, 252, -736, 715, -294, 238, -725, 266, -723, 269, -727, 741, -243, 756, -244, 249, -741, 247, -739, 244, -756, 244, -755, 715, -265, 722, -268, 266, -722, 266, -748, 734, -261, 712, -272, 241, -751, 737, -246, 746, -247, 267, -719, 743, -262, 251]
+          repeat: { times: 8, wait_time: 8ms }
+
+  - id: tx_v4
+    then:
+      - remote_transmitter.transmit_raw:
+          code: [268, -736, 243, -753, 713, -266, 252, -735, 265, -724, 245, -743, 245, -742, 736, -261, 737, -262, 723, -262, 238, -758, 713, -291, 226, -743, 265, -720, 266, -723, 738, -267, 746, -243, 266, -725, 267, -722, 270, -731, 264, -724, 245, -741, 717, -265, 721, -295, 226, -759, 741, -243, 723, -267, 725, -299, 724, -245, 265, -733, 255, -723, 742, -263, 251]
+          repeat: { times: 8, wait_time: 8ms }
+
+  - id: tx_v5
+    then:
+      - remote_transmitter.transmit_raw:
+          code: [265, -721, 237, -754, 734, -268, 240, -749, 236, -732, 264, -734, 263, -725, 734, -278, 712, -272, 716, -268, 259, -723, 723, -275, 241, -740, 268, -736, 244, -726, 741, -266, 721, -267, 265, -726, 266, -722, 269, -729, 266, -724, 725, -262, 252, -726, 245, -769, 714, -290, 250, -722, 266, -723, 244, -768, 244, -758, 244, -727, 245, -743, 738, -266, 252]
+          repeat: { times: 8, wait_time: 8ms }
+
+  - id: tx_v6
+    then:
+      - remote_transmitter.transmit_raw:
+          code: [292, -698, 261, -735, 721, -267, 267, -725, 271, -728, 265, -726, 244, -741, 740, -265, 722, -269, 723, -244, 266, -725, 741, -269, 270, -700, 277, -718, 268, -711, 739, -267, 746, -242, 268, -725, 261, -730, 264, -733, 736, -269, 229, -730, 760, -245, 266, -723, 750, -251, 271, -727, 743, -243, 726, -288, 737, -243, 728, -266, 248, -741, 247, -742, 244]
+          repeat: { times: 8, wait_time: 8ms }
+
+  - id: tx_lum
+    then:
+      - remote_transmitter.transmit_raw:
+          code: [267, -727, 267, -720, 736, -267, 252, -735, 265, -723, 268, -719, 265, -722, 736, -266, 744, -243, 747, -243, 266, -725, 724, -268, 264, -733, 256, -723, 269, -736, 715, -266, 747, -243, 267, -725, 268, -723, 270, -729, 744, -243, 249, -741, 247, -743, 741, -264, 250, -748, 714, -265, 722, -269, 266, -748, 264, -721, 260, -731, 734, -243, 268, -724, 271]
+          repeat: { times: 8, wait_time: 8ms }
+
+  - id: tx_couleur
+    then:
+      - remote_transmitter.transmit_raw:
+          code: [272, -734, 242, -740, 736, -267, 228, -757, 242, -743, 245, -742, 242, -745, 740, -268, 719, -268, 724, -265, 267, -724, 720, -268, 262, -733, 255, -741, 244, -739, 715, -291, 719, -267, 228, -757, 241, -738, 242, -767, 714, -262, 735, -263, 724, -267, 229, -757, 242, -767, 713, -265, 252, -739, 737, -267, 249, -743, 739, -237, 733, -264, 252, -739, 242]
+          repeat: { times: 8, wait_time: 8ms }
+
+  - id: tx_sens
+    then:
+      - remote_transmitter.transmit_raw:
+          code: [242, -755, 243, -726, 739, -267, 229, -757, 265, -721, 245, -743, 265, -724, 739, -261, 739, -262, 724, -267, 228, -760, 716, -268, 264, -726, 266, -722, 269, -727, 715, -268, 730, -266, 251, -748, 246, -741, 244, -752, 716, -264, 253, -740, 245, -740, 243, -768, 715, -291, 721, -267, 723, -268, 725, -277, 724, -246, 266, -725, 728, -275, 238, -740, 245]
+          repeat: { times: 8, wait_time: 8ms }
+
+button:
+  - platform: template
+    name: "Power"
+    on_press:
+      - script.execute: tx_power
+      - script.execute:
+          id: apply_cmd
+          cmd: 0
+
+  - platform: template
+    name: "Vitesse 1"
+    on_press:
+      - script.execute: tx_v1
+      - script.execute:
+          id: apply_cmd
+          cmd: 1
+
+  - platform: template
+    name: "Vitesse 2"
+    on_press:
+      - script.execute: tx_v2
+      - script.execute:
+          id: apply_cmd
+          cmd: 2
+
+  - platform: template
+    name: "Vitesse 3"
+    on_press:
+      - script.execute: tx_v3
+      - script.execute:
+          id: apply_cmd
+          cmd: 3
+
+  - platform: template
+    name: "Vitesse 4"
+    on_press:
+      - script.execute: tx_v4
+      - script.execute:
+          id: apply_cmd
+          cmd: 4
+
+  - platform: template
+    name: "Vitesse 5"
+    on_press:
+      - script.execute: tx_v5
+      - script.execute:
+          id: apply_cmd
+          cmd: 5
+
+  - platform: template
+    name: "Vitesse 6"
+    on_press:
+      - script.execute: tx_v6
+      - script.execute:
+          id: apply_cmd
+          cmd: 6
+
+  - platform: template
+    name: "Lumiere"
+    on_press:
+      - script.execute: tx_lum
+      - script.execute:
+          id: apply_cmd
+          cmd: 7
+
+  - platform: template
+    name: "Couleur lumiere"
+    on_press:
+      - script.execute: tx_couleur
+      - script.execute:
+          id: apply_cmd
+          cmd: 8
+
+  - platform: template
+    name: "Sens rotation"
+    on_press:
+      - script.execute: tx_sens
+      - script.execute:
+          id: apply_cmd
+          cmd: 9

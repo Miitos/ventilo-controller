@@ -1,0 +1,15 @@
+# Identifiants Wi-Fi : jamais versionnés (modèle : secrets.example.yaml)
+/secrets.yaml
+
+# Cache de build ESPHome
+/.esphome/
+
+# Environnement Python créé là par erreur (chemin « ~ » pris littéralement)
+/~/
+
+# Divers
+__pycache__/
+*.pyc
+.vscode/
+.DS_Store
+Thumbs.db

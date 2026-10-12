@@ -10,7 +10,7 @@ commandes en HTTP sur le réseau local.
   tient l'état réel (marche, vitesse, lumière, couleur, sens), publié en direct
   sur `/events`.
 
-Client Windows : dépôt [`ventilo-widget`](../ventilo-widget).
+Client Windows : [ventilo-widget](https://github.com/Miitos/ventilo-widget).
 
 ## Matériel
 
